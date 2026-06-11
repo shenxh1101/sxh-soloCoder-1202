@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微博热搜趋势分析命令行工具 - 专业版 v2.0
+微博热搜趋势分析命令行工具 - 专业版 v2.1（长期追踪增强版）
 """
 
 import argparse
@@ -31,7 +31,14 @@ CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.cache')
 SNAPSHOT_DIR = os.path.join(CACHE_DIR, 'snapshots')
 CACHE_CONFIG = os.path.join(CACHE_DIR, 'config.json')
 DEFAULT_CACHE_TTL = 3600
-MAX_SNAPSHOTS_PER_KEYWORD = 20
+MAX_SNAPSHOTS_PER_KEYWORD = 50
+
+WATCH_LEVEL_CONFIG = [
+    (80, '⭐⭐⭐⭐⭐ 重点关注', '\033[95m'),
+    (60, '⭐⭐⭐⭐ 值得关注', '\033[92m'),
+    (40, '⭐⭐⭐ 可观察', '\033[93m'),
+    (0,  '⭐⭐ 一般关注', '\033[90m'),
+]
 
 ASCII_CHARS = [' ', '·', '•', '○', '●', '◆', '■']
 COLORS = ['\033[91m', '\033[92m', '\033[93m', '\033[94m', '\033[95m', '\033[96m']
@@ -46,6 +53,36 @@ SORT_OPTIONS = {
     'rank': ('avg_rank', '平均排名', '↑'),
     'score': ('watch_score', '关注指数', '↓')
 }
+
+
+def generate_smart_filename(keywords=None, start_date=None, end_date=None, num_hours=None, suffix='csv'):
+    if keywords is None:
+        keywords = []
+    if not isinstance(keywords, list):
+        keywords = [keywords]
+
+    safe_keywords = [re.sub(r'[\\/:*?"<>|]', '_', kw) for kw in keywords if kw]
+
+    if num_hours and num_hours == 24:
+        window_str = '最近24h'
+    elif start_date and end_date:
+        sd = start_date.replace('-', '')
+        ed = end_date.replace('-', '')
+        window_str = f'{sd}-{ed}'
+    elif num_hours:
+        window_str = f'{num_hours}h'
+    else:
+        window_str = '分析'
+
+    if len(safe_keywords) == 1:
+        prefix = safe_keywords[0]
+    elif len(safe_keywords) > 1:
+        prefix = f'多关键词对比_{len(safe_keywords)}个'
+    else:
+        prefix = f'批量分析_{len(safe_keywords)}个'
+
+    filename = f'{prefix}_{window_str}.{suffix}'
+    return re.sub(r'[\\/:*?"<>|\s]+', '_', filename)
 
 
 def ensure_cache_dir():
@@ -115,7 +152,7 @@ def get_snapshot_path(keyword, start_date, end_date, timestamp=None):
 
 def parse_snapshot_filename(filepath):
     filename = os.path.basename(filepath).replace('.json', '')
-    match = re.match(r'^(.+)_(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})_(\d+)$', filename)
+    match = re.match(r'^(.+)_(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})_(\d+)(?:_\d+)?$', filename)
     if match:
         keyword = match.group(1).replace('__', ' ')
         start_date = match.group(2)
@@ -125,15 +162,22 @@ def parse_snapshot_filename(filepath):
     return None, None, None, None
 
 
-def save_snapshot(keyword, start_date, end_date, data_list, analysis, data_source='unknown'):
+def save_snapshot(keyword, start_date, end_date, data_list, analysis, data_source='unknown', tags=None, note=None):
     ensure_cache_dir()
-    timestamp = int(time.time())
+    timestamp = int(time.time() * 1000)
+    base_path = get_snapshot_path(keyword, start_date, end_date, timestamp)
+    final_path = base_path
+    counter = 1
+    while os.path.exists(final_path):
+        final_path = base_path.replace('.json', f'_{counter}.json')
+        counter += 1
+    
     snapshot = {
         'keyword': keyword,
         'start_date': start_date,
         'end_date': end_date,
         'timestamp': timestamp,
-        'created_at': datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S'),
+        'created_at': datetime.fromtimestamp(timestamp/1000).strftime('%Y-%m-%d %H:%M:%S'),
         'analysis': {
             'avg_hot': analysis['avg_hot'],
             'peak_hot': analysis['peak_hot'],
@@ -145,12 +189,13 @@ def save_snapshot(keyword, start_date, end_date, data_list, analysis, data_sourc
             'avg_rank': analysis['avg_rank'],
             'data_points': analysis['data_points']
         },
-        'data_source': data_source
+        'data_source': data_source,
+        'tags': tags if tags else [],
+        'note': note if note else ''
     }
     
-    path = get_snapshot_path(keyword, start_date, end_date, timestamp)
     try:
-        with open(path, 'w', encoding='utf-8') as f:
+        with open(final_path, 'w', encoding='utf-8') as f:
             json.dump(snapshot, f, ensure_ascii=False, indent=2)
     except:
         pass
@@ -159,7 +204,25 @@ def save_snapshot(keyword, start_date, end_date, data_list, analysis, data_sourc
     return snapshot
 
 
-def list_snapshots(keyword=None, start_date=None, end_date=None):
+def update_snapshot_meta(snapshot_filepath, tags=None, note=None):
+    if not os.path.exists(snapshot_filepath):
+        return False
+    try:
+        with open(snapshot_filepath, 'r', encoding='utf-8') as f:
+            snap = json.load(f)
+        if tags is not None:
+            snap['tags'] = tags
+        if note is not None:
+            snap['note'] = note
+        with open(snapshot_filepath, 'w', encoding='utf-8') as f:
+            json.dump(snap, f, ensure_ascii=False, indent=2)
+        return True
+    except:
+        return False
+
+
+def list_snapshots(keyword=None, start_date=None, end_date=None, 
+                   window_start=None, window_end=None, tag_filter=None):
     ensure_cache_dir()
     snapshot_files = glob.glob(os.path.join(SNAPSHOT_DIR, '*.json'))
     snapshots = []
@@ -180,6 +243,23 @@ def list_snapshots(keyword=None, start_date=None, end_date=None):
             with open(filepath, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
+            tags = data.get('tags', [])
+            note = data.get('note', '')
+            
+            if tag_filter:
+                if tag_filter not in tags:
+                    continue
+            
+            snap_time = datetime.fromtimestamp(ts / 1000 if ts > 10**12 else ts)
+            if window_start:
+                ws = datetime.strptime(window_start, '%Y-%m-%d')
+                if snap_time < ws:
+                    continue
+            if window_end:
+                we = datetime.strptime(window_end, '%Y-%m-%d') + timedelta(days=1)
+                if snap_time >= we:
+                    continue
+            
             snapshots.append({
                 'filepath': filepath,
                 'keyword': kw,
@@ -188,13 +268,34 @@ def list_snapshots(keyword=None, start_date=None, end_date=None):
                 'timestamp': ts,
                 'created_at': data.get('created_at', ''),
                 'analysis': data.get('analysis', {}),
-                'data_source': data.get('data_source', 'unknown')
+                'data_source': data.get('data_source', 'unknown'),
+                'tags': tags,
+                'note': note
             })
         except:
             continue
     
-    snapshots.sort(key=lambda x: (x['keyword'], x['start_date'], x['timestamp']), reverse=True)
+    snapshots.sort(key=lambda x: x['timestamp'], reverse=True)
+    for idx, s in enumerate(snapshots):
+        s['global_index'] = idx
     return snapshots
+
+
+def get_snapshot_by_global_index(global_index, keyword=None, start_date=None, end_date=None,
+                                  window_start=None, window_end=None, tag_filter=None):
+    snapshots = list_snapshots(keyword, start_date, end_date, window_start, window_end, tag_filter)
+    if 0 <= global_index < len(snapshots):
+        return snapshots[global_index]
+    return None
+
+
+def get_snapshot_by_time_window(keyword, start_date, end_date, index=0):
+    snapshots = list_snapshots(keyword, start_date, end_date)
+    same_window = [s for s in snapshots if s['start_date'] == start_date and s['end_date'] == end_date]
+    same_window.sort(key=lambda x: x['timestamp'], reverse=True)
+    if 0 <= index < len(same_window):
+        return same_window[index]
+    return None
 
 
 def get_snapshot_by_index(keyword, start_date, end_date, index):
@@ -464,75 +565,210 @@ def compare_with_previous(current_stats, prev_stats):
 def calculate_watch_score(analysis, snapshots=None):
     score = 0
     details = []
+    reasons = []
+    risks = []
     
     trend = analysis['trend']
     change_pct = analysis['change_percent']
-    
-    if trend == '上升' and change_pct > 15:
-        score += 30
-        details.append('强势上升趋势 +30')
-    elif trend == '上升' and change_pct > 5:
-        score += 20
-        details.append('稳步上升趋势 +20')
-    elif trend == '平稳':
-        score += 10
-        details.append('平稳趋势 +10')
-    
-    avg_hot = analysis['avg_hot']
-    if avg_hot >= 200000:
-        score += 25
-        details.append('高热度基础 +25')
-    elif avg_hot >= 100000:
-        score += 15
-        details.append('中高热度基础 +15')
-    elif avg_hot >= 50000:
-        score += 5
-        details.append('中等热度基础 +5')
-    
     values = [d['hot'] for d in analysis['data']]
-    volatility = (max(values) - min(values)) / analysis['avg_hot'] * 100 if analysis['avg_hot'] > 0 else 0
-    if volatility < 50:
-        score += 15
-        details.append('热度稳定 +15')
-    elif volatility < 100:
-        score += 5
-        details.append('热度较稳定 +5')
-    
+    avg_hot = analysis['avg_hot']
     avg_rank = analysis['avg_rank']
-    if avg_rank <= 10:
-        score += 20
-        details.append('排名靠前 +20')
-    elif avg_rank <= 20:
-        score += 10
-        details.append('排名适中 +10')
+    peak_hot = analysis['peak_hot']
+    volatility = (max(values) - min(values)) / avg_hot * 100 if avg_hot > 0 else 0
     
+    # ========== 1. 热度基础分 (20分) ==========
+    if avg_hot >= 300000:
+        score += 20
+        details.append(f'极高热度基础({avg_hot:,}) +20')
+        reasons.append(f'热度基础极高(平均{avg_hot:,})，话题关注度充足')
+    elif avg_hot >= 150000:
+        score += 15
+        details.append(f'高热度基础({avg_hot:,}) +15')
+        reasons.append(f'热度基础较高(平均{avg_hot:,})，具备观察价值')
+    elif avg_hot >= 80000:
+        score += 10
+        details.append(f'中高热度基础({avg_hot:,}) +10')
+        reasons.append(f'热度中等偏上(平均{avg_hot:,})')
+    elif avg_hot >= 30000:
+        score += 5
+        details.append(f'中等热度基础({avg_hot:,}) +5')
+    else:
+        risks.append(f'当前热度偏低(平均{avg_hot:,})，关注度可能不足')
+    
+    # ========== 2. 趋势与上涨稳定性 (25分) ==========
+    if trend == '上升':
+        if change_pct > 20:
+            score += 25
+            details.append(f'强势上涨(+{change_pct:.1f}%) +25')
+            reasons.append(f'短期强势上涨(+{change_pct:.1f}%)，动能充足')
+        elif change_pct > 8:
+            score += 18
+            details.append(f'明显上涨(+{change_pct:.1f}%) +18')
+            reasons.append(f'稳步上涨(+{change_pct:.1f}%)')
+        else:
+            score += 10
+            details.append(f'温和上涨(+{change_pct:.1f}%) +10')
+    elif trend == '平稳':
+        score += 8
+        details.append('趋势平稳 +8')
+        if abs(change_pct) < 2:
+            reasons.append('走势非常平稳，可能处于酝酿阶段')
+    else:
+        if change_pct < -15:
+            score -= 10
+            details.append(f'持续下跌({change_pct:.1f}%) -10')
+            risks.append(f'短期持续下跌({change_pct:.1f}%)，动能衰减')
+        elif change_pct < -5:
+            score -= 5
+            details.append(f'小幅下跌({change_pct:.1f}%) -5')
+    
+    # ========== 3. 历史上涨稳定性 (15分) ==========
     if snapshots and len(snapshots) >= 2:
-        recent_changes = []
-        for i in range(min(3, len(snapshots) - 1)):
+        recent_avg_changes = []
+        recent_rank_changes = []
+        recent_peaks = []
+        analysis_window_start = analysis.get('data', [{}])[0].get('time', '')[:10]
+        analysis_window_end = analysis.get('data', [{}])[-1].get('time', '')[:10]
+        
+        for i in range(min(5, len(snapshots) - 1)):
             curr = snapshots[i]['analysis']
             prev = snapshots[i + 1]['analysis']
-            if 'avg_hot' in curr and 'avg_hot' in prev:
-                change = (curr['avg_hot'] - prev['avg_hot']) / prev['avg_hot'] * 100
-                recent_changes.append(change)
+            if 'avg_hot' in curr and 'avg_hot' in prev and prev['avg_hot'] > 0:
+                chg = (curr['avg_hot'] - prev['avg_hot']) / prev['avg_hot'] * 100
+                recent_avg_changes.append(chg)
+            if 'avg_rank' in curr and 'avg_rank' in prev:
+                rd = prev['avg_rank'] - curr['avg_rank']
+                recent_rank_changes.append(rd)
+            if 'peak_hot' in curr:
+                recent_peaks.append(curr['peak_hot'])
         
-        if recent_changes:
-            consistent_rising = all(c > 0 for c in recent_changes)
-            if consistent_rising and len(recent_changes) >= 2:
-                score += 20
-                details.append(f'连续{len(recent_changes)}次上涨 +20')
+        if len(recent_avg_changes) >= 2:
+            rising_count = sum(1 for c in recent_avg_changes if c > 0)
+            if rising_count == len(recent_avg_changes):
+                score += 15
+                details.append(f'连续{len(recent_avg_changes)}次上涨 +15')
+                reasons.append(f'近{len(recent_avg_changes)}次追踪连续上涨，上涨稳定性极佳')
+            elif rising_count >= len(recent_avg_changes) * 0.7:
+                score += 10
+                details.append(f'{rising_count}/{len(recent_avg_changes)}次上涨 +10')
+                reasons.append(f'近{len(recent_avg_changes)}次追踪中{rising_count}次上涨，稳定性良好')
+            elif rising_count >= len(recent_avg_changes) * 0.5:
+                score += 5
+                details.append(f'{rising_count}/{len(recent_avg_changes)}次上涨 +5')
+            else:
+                risks.append(f'近{len(recent_avg_changes)}次追踪仅{rising_count}次上涨，上涨稳定性欠佳')
+        
+        if len(recent_rank_changes) >= 2:
+            rank_improved = sum(1 for r in recent_rank_changes if r > 0)
+            if rank_improved == len(recent_rank_changes):
+                score += 10
+                details.append(f'排名连续{len(recent_rank_changes)}次提升 +10')
+                reasons.append(f'排名连续{len(recent_rank_changes)}次改善，关注度持续走高')
+            elif rank_improved >= len(recent_rank_changes) * 0.7:
+                score += 5
+                details.append(f'排名多数改善 +5')
+        
+        if len(recent_peaks) >= 3:
+            peak_std = statistics_stdev(recent_peaks)
+            peak_cv = peak_std / (sum(recent_peaks) / len(recent_peaks)) if recent_peaks else 0
+            if peak_cv > 0.6:
+                score -= 10
+                details.append(f'峰值波动剧烈(CV={peak_cv:.2f}) -10')
+                risks.append(f'近{len(recent_peaks)}次峰值波动剧烈(变异系数{peak_cv:.2f})，爆发不稳定')
+            elif peak_cv > 0.3:
+                score -= 3
+                details.append(f'峰值有波动(CV={peak_cv:.2f}) -3')
+                risks.append(f'峰值存在一定波动')
+            else:
+                score += 5
+                details.append(f'峰值稳定(CV={peak_cv:.2f}) +5')
+                reasons.append(f'多次追踪峰值表现稳定')
     
-    score = min(score, 100)
+    # ========== 4. 当前峰值爆发力 (10分) ==========
+    if peak_hot >= 500000:
+        score += 10
+        details.append(f'峰值爆发力强({peak_hot:,}) +10')
+        reasons.append(f'峰值热度极高({peak_hot:,})，爆发力强劲')
+    elif peak_hot >= 250000:
+        score += 7
+        details.append(f'峰值爆发力较好({peak_hot:,}) +7')
+        reasons.append(f'峰值热度较高({peak_hot:,})')
+    elif peak_hot >= 100000:
+        score += 3
+        details.append(f'峰值一般({peak_hot:,}) +3')
     
-    if score >= 80:
-        level = '⭐⭐⭐⭐⭐ 重点关注'
-    elif score >= 60:
-        level = '⭐⭐⭐⭐ 值得关注'
-    elif score >= 40:
-        level = '⭐⭐⭐ 可观察'
+    # ========== 5. 热度稳定性 (10分) ==========
+    if volatility < 30:
+        score += 10
+        details.append(f'热度极稳定(波动{volatility:.0f}%) +10')
+        reasons.append(f'日内热度波动仅{volatility:.0f}%，走势非常稳健')
+    elif volatility < 60:
+        score += 7
+        details.append(f'热度稳定(波动{volatility:.0f}%) +7')
+        reasons.append(f'热度波动可控({volatility:.0f}%)')
+    elif volatility > 150:
+        score -= 5
+        details.append(f'热度波动过大({volatility:.0f}%) -5')
+        risks.append(f'日内波动超过{volatility:.0f}%，数据稳定性存疑')
+    elif volatility > 100:
+        score -= 2
+        details.append(f'热度波动偏大({volatility:.0f}%) -2')
+    
+    # ========== 6. 排名与排名改善 (10分) ==========
+    if avg_rank <= 5:
+        score += 10
+        details.append(f'排名极靠前(第{avg_rank}位) +10')
+        reasons.append(f'长期跻身热搜前5，关注度极高')
+    elif avg_rank <= 10:
+        score += 7
+        details.append(f'排名靠前(第{avg_rank}位) +7')
+        reasons.append(f'热搜前10位，关注度高')
+    elif avg_rank <= 20:
+        score += 4
+        details.append(f'排名适中(第{avg_rank}位) +4')
     else:
-        level = '⭐⭐ 一般关注'
+        risks.append(f'热搜排名偏后(第{avg_rank}位)，主流关注度有限')
     
-    return score, level, details
+    # ========== 7. 峰谷健康度 (10分) ==========
+    if len(values) >= 12:
+        first_half = values[:len(values)//2]
+        second_half = values[len(values)//2:]
+        if len(first_half) > 0 and len(second_half) > 0:
+            half_change = (sum(second_half)/len(second_half) - sum(first_half)/len(first_half)) / (sum(first_half)/len(first_half)) * 100 if sum(first_half) > 0 else 0
+            if half_change > 30:
+                score += 10
+                details.append(f'后半段显著升温(+{half_change:.0f}%) +10')
+                reasons.append(f'后半程热度升温明显(+{half_change:.0f}%)，有持续发酵迹象')
+            elif half_change > 10:
+                score += 6
+                details.append(f'后半段升温(+{half_change:.0f}%) +6')
+            elif half_change > -10:
+                score += 3
+                details.append(f'后半段平稳({half_change:+.0f}%) +3')
+            elif half_change < -30:
+                score -= 5
+                details.append(f'后半段快速降温({half_change:.0f}%) -5')
+                risks.append(f'后半程热度快速走低({half_change:.0f}%)，话题可能已过峰')
+    
+    score = max(0, min(score, 100))
+    
+    level = WATCH_LEVEL_CONFIG[-1][1]
+    level_color = WATCH_LEVEL_CONFIG[-1][2]
+    for threshold, lvl, color in WATCH_LEVEL_CONFIG:
+        if score >= threshold:
+            level = lvl
+            level_color = color
+            break
+    
+    return score, level, details, reasons, risks, level_color
+
+
+def statistics_stdev(data):
+    if len(data) < 2:
+        return 0.0
+    mean = sum(data) / len(data)
+    variance = sum((x - mean) ** 2 for x in data) / (len(data) - 1)
+    return math.sqrt(variance)
 
 
 def generate_mock_data(keyword, start_date, end_date, num_hours=None):
@@ -889,6 +1125,60 @@ def generate_batch_summary(analyses, sort_by='avg', watch_mode=False):
     return conclusions
 
 
+def generate_shareable_summary(analyses, sort_by='avg', watch_mode=False):
+    if not analyses:
+        return []
+
+    lines = []
+    rising = [a for a in analyses if a['trend'] == '上升']
+    falling = [a for a in analyses if a['trend'] == '下降']
+    total = len(analyses)
+    lines.append(f"【微博热搜分析】共分析{total}个话题，{len(rising)}个上升，{len(falling)}个下降")
+
+    if watch_mode and any('watch_score' in a for a in analyses):
+        top_watch = sorted([a for a in analyses if 'watch_score' in a],
+                           key=lambda x: x['watch_score'], reverse=True)[:2]
+    else:
+        top_watch = sorted(analyses, key=lambda x: x['avg_hot'], reverse=True)[:2]
+    for a in top_watch:
+        score_str = f"(关注指数{a.get('watch_score', '-')})" if watch_mode and 'watch_score' in a else ''
+        line = f"🏆 最值得关注：「{a['keyword']}」平均热度{a['avg_hot']:,}{score_str}"
+        if len(line) > 50:
+            line = line[:47] + '...'
+        lines.append(line)
+
+    if analyses:
+        most_change = max(analyses, key=lambda x: abs(x['change_percent']))
+        direction = '上升' if most_change['change_percent'] > 0 else '下降'
+        line = f"📈 变化最大：「{most_change['keyword']}」{direction}{abs(most_change['change_percent']):.1f}%"
+        if len(line) > 50:
+            line = line[:47] + '...'
+        lines.append(line)
+
+    abnormal = []
+    for a in analyses:
+        values = [d['hot'] for d in a.get('data', [])]
+        volatility = (max(values) - min(values)) / a['avg_hot'] * 100 if a['avg_hot'] > 0 and values else 0
+        rank_change = a.get('changes', {}).get('avg_rank', {}).get('diff', 0)
+        if volatility > 150 or abs(rank_change) > 10:
+            abnormal.append(a)
+    for a in abnormal[:2]:
+        values = [d['hot'] for d in a.get('data', [])]
+        volatility = (max(values) - min(values)) / a['avg_hot'] * 100 if a['avg_hot'] > 0 and values else 0
+        rank_change = a.get('changes', {}).get('avg_rank', {}).get('diff', 0)
+        reasons = []
+        if volatility > 150:
+            reasons.append(f"波动{volatility:.0f}%")
+        if abs(rank_change) > 10:
+            reasons.append(f"排名变化{rank_change:+d}位")
+        line = f"⚠️ 异常波动：「{a['keyword']}」{'/'.join(reasons)}"
+        if len(line) > 50:
+            line = line[:47] + '...'
+        lines.append(line)
+
+    return lines
+
+
 def draw_ascii_chart(datasets, width=80, height=20):
     if not datasets:
         return ""
@@ -1035,6 +1325,8 @@ def export_summary_csv(analyses, output_file, sort_by='avg', watch_mode=False):
         
         has_changes = any('changes' in a for a in analyses)
         has_score = any('watch_score' in a for a in analyses)
+        has_reasons = any('watch_reasons' in a for a in analyses)
+        has_risks = any('watch_risks' in a for a in analyses)
         
         header = [
             '关键词', '平均热度', '峰值热度', '峰值时间',
@@ -1047,6 +1339,10 @@ def export_summary_csv(analyses, output_file, sort_by='avg', watch_mode=False):
             ])
         if has_score:
             header.extend(['关注指数', '关注等级'])
+        if has_reasons:
+            header.append('关注理由')
+        if has_risks:
+            header.append('风险点')
         writer.writerow(header)
         
         for a in analyses:
@@ -1076,6 +1372,10 @@ def export_summary_csv(analyses, output_file, sort_by='avg', watch_mode=False):
                     a.get('watch_score', ''),
                     a.get('watch_level', '')
                 ])
+            if has_reasons:
+                row.append('|'.join(a.get('watch_reasons', [])))
+            if has_risks:
+                row.append('|'.join(a.get('watch_risks', [])))
             writer.writerow(row)
         
         writer.writerow([])
@@ -1101,6 +1401,11 @@ def export_markdown_report(analyses, datasets, output_file, sort_by='avg', watch
         f.write(f'> 排序方式: 按{sort_name} ({sort_order})\n\n')
         if watch_mode:
             f.write(f'> 分析模式: 关注清单模式\n\n')
+        
+        f.write('## 📱 转发摘要\n\n')
+        for line in generate_shareable_summary(analyses, sort_by, watch_mode):
+            f.write(f'> {line}\n')
+        f.write('\n')
         
         f.write('## 📊 分析概览\n\n')
         f.write(f'- 分析话题数: {len(analyses)} 个\n')
@@ -1131,7 +1436,30 @@ def export_markdown_report(analyses, datasets, output_file, sort_by='avg', watch
                 f.write(f' {a.get("watch_score", "-")} | {a.get("watch_level", "-")} |')
             f.write('\n')
         
-        f.write('\n## 📊 趋势对比图\n\n')
+        if watch_mode:
+            f.write('\n## ✨ 关注理由与风险点\n\n')
+            scored = [a for a in analyses if 'watch_score' in a]
+            if scored:
+                for a in sorted(scored, key=lambda x: x['watch_score'], reverse=True):
+                    f.write(f'### 「{a["keyword"]}」(关注指数: {a["watch_score"]} - {a.get("watch_level", "")})\n\n')
+                    reasons = a.get('watch_reasons', [])
+                    risks = a.get('watch_risks', [])
+                    if reasons:
+                        f.write('**✅ 关注理由:**\n\n')
+                        for r in reasons:
+                            f.write(f'- {r}\n')
+                        f.write('\n')
+                    if risks:
+                        f.write('**⚠️ 风险点:**\n\n')
+                        for r in risks:
+                            f.write(f'- {r}\n')
+                        f.write('\n')
+                    if not reasons and not risks:
+                        f.write('暂无显著特征。\n\n')
+            else:
+                f.write('暂无关注评分数据。\n\n')
+        
+        f.write('## 📊 趋势对比图\n\n')
         f.write('```\n')
         chart = draw_ascii_chart(datasets, width=90, height=20)
         f.write(chart.replace(COLORS[0], '').replace(COLORS[1], '').replace(COLORS[2], '')
@@ -1141,9 +1469,9 @@ def export_markdown_report(analyses, datasets, output_file, sort_by='avg', watch
         
         if watch_mode:
             f.write('## 🌟 关注清单\n\n')
-            high_priority = [a for a in analyses if a.get('watch_score', 0) >= 60]
-            if high_priority:
-                for a in sorted(high_priority, key=lambda x: x['watch_score'], reverse=True):
+            scored = [a for a in analyses if 'watch_score' in a]
+            if scored:
+                for a in sorted(scored, key=lambda x: x['watch_score'], reverse=True):
                     f.write(f'### {a["watch_level"]} - {a["keyword"]} (关注指数: {a["watch_score"]})\n\n')
                     f.write('- **打分依据:**\n')
                     for detail in a.get('watch_details', []):
@@ -1154,7 +1482,7 @@ def export_markdown_report(analyses, datasets, output_file, sort_by='avg', watch
                     f.write(f'  - 趋势: {a["trend"]} ({a["change_percent"]:+.1f}%)\n')
                     f.write(f'  - 平均排名: 第{a["avg_rank"]}位\n\n')
             else:
-                f.write('暂无达到关注阈值的话题。\n\n')
+                f.write('暂无关注评分数据。\n\n')
         
         f.write('## 📋 各话题详细分析\n\n')
         for a in analyses:
@@ -1192,6 +1520,36 @@ def export_markdown_report(analyses, datasets, output_file, sort_by='avg', watch
         for line in generate_batch_summary(analyses, sort_by, watch_mode):
             clean_line = line.replace(BOLD, '').replace(RESET, '')
             f.write(f'{clean_line}\n')
+        
+        f.write('\n## 🔍 异常检测\n\n')
+        abnormal_items = []
+        for a in analyses:
+            values = [d['hot'] for d in a.get('data', [])]
+            volatility = (max(values) - min(values)) / a['avg_hot'] * 100 if a['avg_hot'] > 0 and values else 0
+            rank_diff = a.get('changes', {}).get('avg_rank', {}).get('diff', 0)
+            half_change = a.get('half_change', 0)
+            trend = a.get('trend', '')
+            
+            flags = []
+            if volatility > 150:
+                flags.append(f'日内波动 {volatility:.0f}% (>150%)')
+            if rank_diff < -10:
+                flags.append(f'排名下跌 {abs(rank_diff)} 位 (>10位)')
+            if half_change < -30 and trend in ('上升', '平稳'):
+                flags.append('趋势由升转降迹象')
+            
+            if flags:
+                abnormal_items.append((a, flags))
+        
+        if abnormal_items:
+            for a, flags in abnormal_items:
+                f.write(f'### ⚠️ 「{a["keyword"]}」\n\n')
+                for flag in flags:
+                    f.write(f'- {flag}\n')
+                f.write(f'- 当前趋势: {a["trend"]} ({a["change_percent"]:+.1f}%)\n')
+                f.write(f'- 平均热度: {a["avg_hot"]:,}\n\n')
+        else:
+            f.write('未检测到明显异常。\n\n')
     
     return True
 
@@ -1263,63 +1621,107 @@ def print_historical_comparison(keyword, changes, change_descs, prev_stats, prev
             print(f"\n  📝 变化摘要: {', '.join(change_descs)}")
 
 
-def print_snapshot_list(keyword, start_date=None, end_date=None):
-    snapshots = list_snapshots(keyword, start_date, end_date)
+def print_snapshot_list(keyword, start_date=None, end_date=None, 
+                        window_start=None, window_end=None, tag_filter=None):
+    snapshots = list_snapshots(keyword, start_date, end_date, window_start, window_end, tag_filter)
     
     if not snapshots:
-        print(f"📭 暂无「{keyword}」的快照记录")
+        msg_parts = [f"📭 暂无快照记录"]
+        if keyword:
+            msg_parts.append(f'关键词「{keyword}」')
+        if tag_filter:
+            msg_parts.append(f'标签「{tag_filter}」')
+        if window_start or window_end:
+            msg_parts.append(f'时间窗口 {window_start or "*"}~{window_end or "*"}')
+        print(' '.join(msg_parts))
         return
-    
-    grouped = defaultdict(list)
-    for s in snapshots:
-        key = (s['keyword'], s['start_date'], s['end_date'])
-        grouped[key].append(s)
     
     print(f"\n{BOLD}📸 趋势快照库{RESET} - 共 {len(snapshots)} 条记录")
-    print(f"{'═'*90}")
+    filter_hints = []
+    if keyword:
+        filter_hints.append(f'关键词={keyword}')
+    if start_date or end_date:
+        filter_hints.append(f'统计窗 {start_date or "*"}~{end_date or "*"}')
+    if window_start or window_end:
+        filter_hints.append(f'快照时间 {window_start or "*"}~{window_end or "*"}')
+    if tag_filter:
+        filter_hints.append(f'标签={tag_filter}')
+    if filter_hints:
+        print(f"  筛选条件: {' | '.join(filter_hints)}")
+    print(f"  {'─'*50}")
+    print(f"  💡 全局序号 (第1列) 可直接用于 --snapshot-compare 的对比参数")
+    print(f"{'═'*120}")
     
-    for (kw, sd, ed), group in grouped.items():
-        print(f"\n{BOLD}「{kw}」{RESET} - {sd} 至 {ed}")
-        print(f"{'-'*90}")
-        print(f"{'序号':<6} {'快照时间':<20} {'平均热度':>10} {'峰值热度':>10} {'趋势':>8} {'排名':>8} {'来源':>10}")
-        print(f"{'-'*90}")
-        
-        for idx, s in enumerate(reversed(group)):
-            a = s['analysis']
-            print(f"{idx:<6} {s['created_at']:<20} {a.get('avg_hot', '-'):>10,} {a.get('peak_hot', '-'):>10,} "
-                  f"{a.get('trend', '-'):>8} 第{a.get('avg_rank', '-'):>3}位 {s['data_source']:>10}")
+    header = f"{'序号':<6} {'关键词':<14} {'统计窗口':<22} {'快照时间':<20} {'平均热度':>10} {'峰值':>9} {'趋势':>6} {'排名':>5} {'标签/备注':<20}"
+    print(header)
+    print(f"{'-'*120}")
     
-    print(f"\n💡 提示: 使用 --snapshot-compare KEYWORD INDEX1 INDEX2 对比任意两次快照")
+    for s in snapshots:
+        a = s['analysis']
+        tags_str = ' '.join([f'[{t}]' for t in s.get('tags', [])])
+        note_str = s.get('note', '')
+        extra = (tags_str + ' ' + note_str).strip()[:18]
+        window_str = f"{s['start_date']}~{s['end_date']}"
+        print(f"{s['global_index']:<6} {s['keyword']:<14} {window_str:<22} {s['created_at']:<20} "
+              f"{a.get('avg_hot', '-'):>10,} {a.get('peak_hot', '-'):>9,} "
+              f"{a.get('trend', '-'):>6} {a.get('avg_rank', '-'):>4}位 {extra:<20}")
+    
+    print(f"\n💡 操作:")
+    print(f"   • 对比两次快照: --snapshot-compare KEYWORD IDX1 IDX2 [--global-idx]")
+    print(f"   • 添加标签/备注: --snapshot-tag IDX \"活动前,重要\" --snapshot-note IDX \"618大促前\"")
+    print(f"   • 按时间窗口筛选: --snapshot-list KEYWORD --window-start 2024-06-01 --window-end 2024-06-10")
+    print(f"   • 按标签筛选: --snapshot-list KEYWORD --tag-filter 活动前")
 
 
-def compare_snapshots(keyword, index1, index2, start_date=None, end_date=None):
-    snapshots = list_snapshots(keyword, start_date, end_date)
-    keyword_snapshots = [s for s in snapshots if s['keyword'] == keyword]
+def compare_snapshots(keyword, index1, index2, start_date=None, end_date=None,
+                      use_global_index=False, window_start=None, window_end=None, tag_filter=None):
+    all_snapshots = list_snapshots(keyword, start_date, end_date, window_start, window_end, tag_filter)
     
-    if not keyword_snapshots:
-        print(f"❌ 未找到「{keyword}」的快照记录")
-        return
+    if use_global_index:
+        s1 = get_snapshot_by_global_index(index1, keyword, start_date, end_date,
+                                          window_start, window_end, tag_filter)
+        s2 = get_snapshot_by_global_index(index2, keyword, start_date, end_date,
+                                          window_start, window_end, tag_filter)
+        idx_mode = '全局序号'
+    else:
+        keyword_snapshots = [s for s in all_snapshots if s['keyword'] == keyword]
+        if not keyword_snapshots:
+            print(f"❌ 未找到「{keyword}」的快照记录")
+            return None
+        for idx in [index1, index2]:
+            if idx < 0 or idx >= len(keyword_snapshots):
+                print(f"❌ 快照序号 {idx} 超出范围 (有效范围: 0-{len(keyword_snapshots)-1})")
+                return None
+        s1 = keyword_snapshots[index1]
+        s2 = keyword_snapshots[index2]
+        idx_mode = '关键词内序号'
     
-    if index1 < 0 or index1 >= len(keyword_snapshots):
-        print(f"❌ 快照序号 {index1} 超出范围 (有效范围: 0-{len(keyword_snapshots)-1})")
-        return
-    if index2 < 0 or index2 >= len(keyword_snapshots):
-        print(f"❌ 快照序号 {index2} 超出范围 (有效范围: 0-{len(keyword_snapshots)-1})")
-        return
-    
-    s1 = keyword_snapshots[index1]
-    s2 = keyword_snapshots[index2]
+    if not s1 or not s2:
+        print(f"❌ 未找到指定快照，请检查序号和筛选条件")
+        return None
     
     a1 = s1['analysis']
     a2 = s2['analysis']
     
     print(f"\n{BOLD}📊 快照对比分析{RESET}")
-    print(f"{'═'*90}")
-    print(f"  关键词: {BOLD}{keyword}{RESET}")
-    print(f"  时间窗口: {s1['start_date']} 至 {s1['end_date']}")
-    print(f"{'─'*90}")
-    print(f"{'指标':<12} {s1['created_at'][:16]:>20} {s2['created_at'][:16]:>20} {'变化':>20}")
-    print(f"{'-'*90}")
+    print(f"{'═'*110}")
+    print(f"  关键词: {BOLD}{s1['keyword']}{RESET}  |  序号模式: {idx_mode}")
+    print(f"  统计窗口: {s1['start_date']} 至 {s1['end_date']}")
+    print(f"{'─'*110}")
+    
+    def fmt_meta(s):
+        parts = [s['created_at']]
+        if s.get('tags'):
+            parts.append(' '.join([f'[{t}]' for t in s['tags']]))
+        if s.get('note'):
+            parts.append(f"📝{s['note'][:12]}")
+        return ' '.join(parts)
+    
+    label1 = fmt_meta(s1)
+    label2 = fmt_meta(s2)
+    col_w = 45
+    print(f"{'指标':<12} {label1[:col_w]:>{col_w}} {label2[:col_w]:>{col_w}} {'变化':>16}")
+    print(f"{'-'*110}")
     
     metrics = [
         ('平均热度', 'avg_hot', ',', False),
@@ -1329,6 +1731,7 @@ def compare_snapshots(keyword, index1, index2, start_date=None, end_date=None):
         ('平均排名', 'avg_rank', 'd', True),
     ]
     
+    significant_changes = []
     for name, key, fmt, is_rank in metrics:
         v1 = a1.get(key, 0)
         v2 = a2.get(key, 0)
@@ -1339,40 +1742,63 @@ def compare_snapshots(keyword, index1, index2, start_date=None, end_date=None):
             display_v1 = f"第{v1:{fmt}}位"
             display_v2 = f"第{v2:{fmt}}位"
             diff_display = f"{diff:+d}位"
+            if abs(diff) >= 5:
+                significant_changes.append((name, v1, v2, diff, pct, is_rank))
         else:
             pct = (diff / v2 * 100) if v2 != 0 else 0
             display_v1 = f"{v1:{fmt}}"
             display_v2 = f"{v2:{fmt}}"
             diff_display = f"{diff:+{fmt}} ({pct:+.1f}%)"
+            if abs(pct) >= 20:
+                significant_changes.append((name, v1, v2, diff, pct, is_rank))
         
         color = '\033[92m' if (not is_rank and diff > 0) or (is_rank and diff > 0) else \
                 '\033[91m' if (not is_rank and diff < 0) or (is_rank and diff < 0) else '\033[93m'
         
-        print(f"  {name:<12} {display_v1:>20} {display_v2:>20} {color}{diff_display:>20}{RESET}")
+        print(f"  {name:<12} {display_v1:>{col_w}} {display_v2:>{col_w}} {color}{diff_display:>16}{RESET}")
     
-    print(f"{'-'*90}")
-    print(f"  趋势对比: {a1.get('trend', '-'):>16} vs {a2.get('trend', '-'):>16}")
-    print(f"  数据来源: {s1['data_source']:>16} vs {s2['data_source']:>16}")
-    print(f"{'═'*90}")
+    print(f"{'-'*110}")
+    print(f"  趋势对比: {a1.get('trend', '-'):>{col_w-8}} vs {a2.get('trend', '-'):>{col_w-8}}")
+    print(f"  数据来源: {s1['data_source']:>{col_w-8}} vs {s2['data_source']:>{col_w-8}}")
+    print(f"{'═'*110}")
     
     print(f"\n{BOLD}💡 对比结论{RESET}")
     avg_diff = a1.get('avg_hot', 0) - a2.get('avg_hot', 0)
     avg_pct = (avg_diff / a2.get('avg_hot', 1) * 100) if a2.get('avg_hot', 1) > 0 else 0
     
-    if abs(avg_pct) >= 20:
-        direction = "显著提升" if avg_pct > 0 else "显著下降"
-        print(f"  • 平均热度{direction}，变化幅度达{abs(avg_pct):.1f}%")
-    elif abs(avg_pct) >= 5:
-        direction = "有所上升" if avg_pct > 0 else "有所下降"
+    if abs(avg_pct) >= 30:
+        direction = "大幅提升" if avg_pct > 0 else "大幅下降"
+        print(f"  🔥 平均热度{direction}，变化幅度达{abs(avg_pct):.1f}%，属于明显变化")
+    elif abs(avg_pct) >= 10:
+        direction = "明显上升" if avg_pct > 0 else "明显下降"
+        print(f"  📈 平均热度{direction}，变化幅度{abs(avg_pct):.1f}%")
+    elif abs(avg_pct) >= 3:
+        direction = "略有上升" if avg_pct > 0 else "略有下降"
         print(f"  • 平均热度{direction}，变化幅度{abs(avg_pct):.1f}%")
     else:
         print(f"  • 平均热度基本持平，变化幅度仅{abs(avg_pct):.1f}%")
     
     if a1.get('trend') != a2.get('trend'):
-        print(f"  • 趋势发生变化: {a2.get('trend')} → {a1.get('trend')}")
+        print(f"  ⚠️  趋势发生变化: {a2.get('trend')} → {a1.get('trend')}")
+    
+    if significant_changes:
+        print(f"\n{BOLD}📌 显著变化指标:{RESET}")
+        for name, v1, v2, diff, pct, is_rank in significant_changes:
+            if is_rank:
+                arrow = '↑' if diff > 0 else '↓'
+                print(f"    • {name}: {arrow} 变化{abs(diff)}位")
+            else:
+                arrow = '↑' if pct > 0 else '↓'
+                print(f"    • {name}: {arrow} {abs(pct):.1f}%")
+    
+    result = {
+        's1': s1, 's2': s2, 'significant_changes': significant_changes,
+        'avg_pct': avg_pct, 'trend_changed': a1.get('trend') != a2.get('trend')
+    }
+    return result
 
 
-def print_analysis(keyword, full_data, data_source, cache_hit, prev_cache=None, prev_snapshot=None, save_snapshot_flag=True):
+def print_analysis(keyword, full_data, data_source, cache_hit, prev_cache=None, prev_snapshot=None, save_snapshot_flag=True, tags=None, note=None):
     data_list = full_data if isinstance(full_data, list) else full_data['data']
     
     print(f"\n{'═'*60}")
@@ -1463,7 +1889,7 @@ def print_analysis(keyword, full_data, data_source, cache_hit, prev_cache=None, 
     if save_snapshot_flag:
         start_d = full_data.get('start_date', '') if isinstance(full_data, dict) else ''
         end_d = full_data.get('end_date', '') if isinstance(full_data, dict) else ''
-        save_snapshot(keyword, start_d, end_d, data_list, analysis, data_source)
+        save_snapshot(keyword, start_d, end_d, data_list, analysis, data_source, tags=tags, note=note)
     
     print(f"\n{BOLD}💡 分析结论{RESET}")
     conclusions = generate_conclusion(keyword, analysis, data_list)
@@ -1475,7 +1901,8 @@ def print_analysis(keyword, full_data, data_source, cache_hit, prev_cache=None, 
 
 
 def batch_analysis(keywords, start_date, end_date, output_file=None, export_csv=False, 
-                   use_cache=True, force_mock=False, num_hours=None, sort_by='avg', watch_mode=False):
+                   use_cache=True, force_mock=False, num_hours=None, sort_by='avg', watch_mode=False,
+                   save_snapshot_flag=True, snapshot_tags=None, snapshot_note=None):
     print(f"\n{'#'*60}")
     print(f"{BOLD}# 📋 批量查询分析报告 - {len(keywords)} 个话题{RESET}")
     print(f"# 📅 时间范围: {start_date} 至 {end_date}")
@@ -1497,14 +1924,18 @@ def batch_analysis(keywords, start_date, end_date, output_file=None, export_csv=
         )
         datasets.append({'keyword': keyword, 'data': data['data'], 'source': source})
         
-        analysis = print_analysis(keyword, data, source, cache_hit, prev_cache, prev_snapshot)
+        analysis = print_analysis(keyword, data, source, cache_hit, prev_cache, prev_snapshot,
+                                  save_snapshot_flag=save_snapshot_flag, tags=snapshot_tags, note=snapshot_note)
         if analysis:
             if watch_mode:
                 keyword_snapshots = list_snapshots(keyword, start_date, end_date)
-                score, level, details = calculate_watch_score(analysis, keyword_snapshots)
+                score, level, details, reasons, risks, level_color = calculate_watch_score(analysis, keyword_snapshots)
                 analysis['watch_score'] = score
                 analysis['watch_level'] = level
                 analysis['watch_details'] = details
+                analysis['watch_reasons'] = reasons
+                analysis['watch_risks'] = risks
+                analysis['watch_level_color'] = level_color
             analyses.append(analysis)
     
     print(f"\n{'═'*60}")
@@ -1559,6 +1990,26 @@ def batch_analysis(keywords, start_date, end_date, output_file=None, export_csv=
     
     for line in generate_batch_summary(sorted_analyses, sort_by, watch_mode):
         print(line)
+    
+    if watch_mode:
+        scored = [a for a in sorted_analyses if 'watch_score' in a]
+        if scored:
+            print(f"\n{BOLD}✨ 关注清单 - 理由与风险点{RESET}")
+            print(f"{'═'*90}")
+            for a in sorted(scored, key=lambda x: x['watch_score'], reverse=True):
+                level_color = a.get('watch_level_color', '')
+                print(f"\n{level_color}{BOLD}{a['watch_level']}{RESET} - {BOLD}「{a['keyword']}」{RESET} (指数: {a.get('watch_score', 0)})")
+                if a.get('watch_reasons'):
+                    print(f"  ✅ 值得关注：")
+                    for r in a['watch_reasons']:
+                        print(f"     • {r}")
+                if a.get('watch_risks'):
+                    print(f"  ⚠️  风险点：")
+                    for r in a['watch_risks']:
+                        print(f"     • {r}")
+                if not a.get('watch_reasons') and not a.get('watch_risks'):
+                    print(f"     (暂无显著特征)")
+            print(f"\n{'═'*90}")
     
     return sorted_analyses
 
@@ -1687,7 +2138,34 @@ def handle_cache_command(args):
 
 def handle_snapshot_command(args):
     if args.snapshot_list:
-        print_snapshot_list(args.snapshot_list)
+        print_snapshot_list(args.snapshot_list, 
+                           window_start=args.window_start,
+                           window_end=args.window_end,
+                           tag_filter=args.tag_filter)
+        return
+    
+    if args.snapshot_tag or args.snapshot_note:
+        if args.snapshot_index is None:
+            print("❌ 请通过 --snapshot-index 指定快照全局序号")
+            return
+        snap = get_snapshot_by_global_index(args.snapshot_index)
+        if not snap:
+            print(f"❌ 未找到全局序号为 {args.snapshot_index} 的快照")
+            return
+        tags = snap.get('tags', [])
+        note = snap.get('note', '')
+        if args.snapshot_tag is not None:
+            tags = [t.strip() for t in args.snapshot_tag.split(',') if t.strip()]
+        if args.snapshot_note is not None:
+            note = args.snapshot_note
+        if update_snapshot_meta(snap['filepath'], tags=tags, note=note):
+            tag_str = ' '.join([f'[{t}]' for t in tags]) if tags else '(无标签)'
+            note_str = f'📝{note}' if note else '(无备注)'
+            print(f"✅ 快照 #{args.snapshot_index}「{snap['keyword']}」已更新")
+            print(f"   标签: {tag_str}")
+            print(f"   备注: {note_str}")
+        else:
+            print(f"❌ 更新快照失败")
         return
     
     if args.snapshot_compare:
@@ -1696,7 +2174,11 @@ def handle_snapshot_command(args):
             return
         keyword, idx1, idx2 = args.snapshot_compare
         try:
-            compare_snapshots(keyword, int(idx1), int(idx2))
+            compare_snapshots(keyword, int(idx1), int(idx2),
+                             use_global_index=args.global_idx,
+                             window_start=args.window_start,
+                             window_end=args.window_end,
+                             tag_filter=args.tag_filter)
         except ValueError:
             print("❌ 序号必须是数字")
         return
@@ -1704,7 +2186,7 @@ def handle_snapshot_command(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='微博热搜趋势分析工具 - 专业版 v2.0',
+        description='微博热搜趋势分析工具 - 专业版 v2.1（长期追踪增强版）',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例用法:
@@ -1712,36 +2194,34 @@ def main():
   # 单关键词（最近24小时）
   %(prog)s -k "AI人工智能"
   
-  # 指定日期范围（最多7天）
-  %(prog)s -k "高考" -s 2024-06-01 -e 2024-06-07
+  # 只看历史快照，不重新抓取
+  %(prog)s -k "高考" --history-only
   
-  # 双关键词对比
-  %(prog)s -k "端午节" -c "中秋节"
+  # 不保存本次快照
+  %(prog)s -k "618" --no-snapshot
   
-  # ===== 导出报告 =====
-  # 导出CSV + 汇总 + Markdown报告
-  %(prog)s -k "世界杯" --export worldcup.csv
-  
-  # ===== 批量查询 =====
-  # 批量查询，按峰值排序，导出报告
-  %(prog)s -b keywords.txt -o batch_report.csv --sort-by peak
-  
-  # 关注清单模式（综合打分）
-  %(prog)s -b keywords.txt --watch-mode -o watch_report.csv
+  # 给本次快照加标签和备注
+  %(prog)s -k "618" --snapshot-tag "大促,重要" --snapshot-note "618大促当天"
   
   # ===== 快照管理 =====
-  # 查看某关键词的快照历史
+  # 查看快照列表（按时间窗口/标签筛选）
   %(prog)s --snapshot-list "AI人工智能"
+  %(prog)s --snapshot-list "AI人工智能" --window-start 2024-06-01 --tag-filter 重要
   
-  # 对比任意两次快照
-  %(prog)s --snapshot-compare "AI人工智能" 0 1
+  # 给已有快照加标签/备注（用全局序号）
+  %(prog)s --snapshot-index 0 --snapshot-tag "活动前,预热" --snapshot-note "618预热期"
+  
+  # 对比两次快照（全局序号模式，严格对应列表显示的序号）
+  %(prog)s --snapshot-compare "AI人工智能" 0 1 --global-idx
+  
+  # ===== 批量查询 =====
+  # 自动生成文件名（包含关键词和时间窗口）
+  %(prog)s -b keywords.txt --watch-mode -o auto
   
   # ===== 缓存管理 =====
   %(prog)s --cache-list
-  %(prog)s --cache-list --cache-filter-kw "高考" --cache-filter-status valid
   %(prog)s --cache-ttl 7200
   %(prog)s --cache-clear "高考"
-  %(prog)s --cache-clear
 
 排序方式 (--sort-by):
   avg    按平均热度（默认）
@@ -1757,7 +2237,7 @@ def main():
     parser.add_argument('-s', '--start-date', help='开始日期 (YYYY-MM-DD)')
     parser.add_argument('-e', '--end-date', help='结束日期 (YYYY-MM-DD)')
     parser.add_argument('-b', '--batch', help='从文本文件批量读取关键词')
-    parser.add_argument('-o', '--output', help='CSV导出文件路径')
+    parser.add_argument('-o', '--output', help='CSV导出文件路径，设为 auto 时自动命名')
     parser.add_argument('--export', help='导出数据到CSV文件')
     parser.add_argument('--no-cache', action='store_true', help='不使用缓存')
     parser.add_argument('--mock', action='store_true', help='强制使用模拟数据')
@@ -1766,12 +2246,29 @@ def main():
     parser.add_argument('--sort-by', choices=list(SORT_OPTIONS.keys()), default='avg',
                         help='批量报告排序方式: avg/peak/change/rank/score (默认: avg)')
     parser.add_argument('--watch-mode', action='store_true', help='关注清单模式：综合打分排序')
+    parser.add_argument('--no-snapshot', action='store_true', help='不保存本次分析快照')
+    parser.add_argument('--history-only', action='store_true',
+                        help='只展示历史快照对比，不重新抓取新数据')
+    parser.add_argument('--snapshot-tag', metavar='TAGS',
+                        help='本次快照/已有快照的标签，多个用逗号分隔')
+    parser.add_argument('--snapshot-note', metavar='NOTE',
+                        help='本次快照/已有快照的备注文字')
     
     snapshot_group = parser.add_argument_group('快照管理')
     snapshot_group.add_argument('--snapshot-list', metavar='KEYWORD',
                                 help='查看某关键词的快照历史')
     snapshot_group.add_argument('--snapshot-compare', nargs=3, metavar=('KEYWORD', 'INDEX1', 'INDEX2'),
                                 help='对比某关键词的两次快照')
+    snapshot_group.add_argument('--snapshot-index', type=int, metavar='IDX',
+                                help='指定快照全局序号（用于标签/备注编辑）')
+    snapshot_group.add_argument('--global-idx', action='store_true',
+                                help='--snapshot-compare 使用全局序号（默认关键词内序号）')
+    snapshot_group.add_argument('--window-start', metavar='DATE',
+                                help='快照筛选: 抓取时间>= (YYYY-MM-DD)')
+    snapshot_group.add_argument('--window-end', metavar='DATE',
+                                help='快照筛选: 抓取时间<= (YYYY-MM-DD)')
+    snapshot_group.add_argument('--tag-filter', metavar='TAG',
+                                help='快照筛选: 只显示包含指定标签的快照')
     
     cache_group = parser.add_argument_group('缓存管理')
     cache_group.add_argument('--cache-list', action='store_true', help='列出所有缓存')
@@ -1786,7 +2283,11 @@ def main():
     
     args = parser.parse_args()
     
-    if args.snapshot_list or args.snapshot_compare:
+    snapshot_management_only = (
+        args.snapshot_list or args.snapshot_compare or 
+        ((args.snapshot_tag or args.snapshot_note) and not (args.keyword or args.batch))
+    )
+    if snapshot_management_only:
         handle_snapshot_command(args)
         return
     
@@ -1809,8 +2310,39 @@ def main():
         print(f"{BOLD}📊 报告设置{RESET}{sort_desc}")
     if args.watch_mode:
         print(f"{BOLD}🔍 分析模式{RESET}: 关注清单模式")
+    if args.no_snapshot:
+        print(f"{BOLD}💾 快照{RESET}: 本次不保存")
+    if args.history_only:
+        print(f"{BOLD}⏱️  模式{RESET}: 只看历史快照，不重新抓取")
+    if args.snapshot_tag or args.snapshot_note:
+        print(f"{BOLD}🏷️  快照元数据{RESET}: ", end="")
+        if args.snapshot_tag:
+            print(f"标签=[{args.snapshot_tag}] ", end="")
+        if args.snapshot_note:
+            print(f"备注=\"{args.snapshot_note}\" ", end="")
+        print()
     
     use_cache = not args.no_cache
+    user_tags = [t.strip() for t in args.snapshot_tag.split(',') if t.strip()] if args.snapshot_tag else None
+    user_note = args.snapshot_note
+    
+    output_file = args.output
+    if output_file == 'auto':
+        if args.batch:
+            kws = read_keywords_from_file(args.batch)
+            output_file = generate_smart_filename(kws, start_date, end_date, num_hours, 'csv')
+        elif args.compare:
+            output_file = generate_smart_filename([args.keyword, args.compare],
+                                                 start_date, end_date, num_hours, 'csv')
+        else:
+            output_file = generate_smart_filename([args.keyword], start_date, end_date, num_hours, 'csv')
+        print(f"\n💾 自动生成文件名: {output_file}")
+    
+    if args.history_only and args.keyword:
+        print(f"\n{BOLD}⏱️  历史快照模式{RESET}: 只显示历史记录，不抓取新数据")
+        print_snapshot_list(args.keyword, window_start=args.window_start,
+                           window_end=args.window_end, tag_filter=args.tag_filter)
+        return
     
     if args.batch:
         keywords = read_keywords_from_file(args.batch)
@@ -1819,9 +2351,11 @@ def main():
             sys.exit(1)
         
         batch_analysis(keywords, start_date, end_date, 
-                      output_file=args.output, export_csv=bool(args.output),
+                      output_file=output_file, export_csv=bool(output_file),
                       use_cache=use_cache, force_mock=args.mock,
-                      num_hours=num_hours, sort_by=args.sort_by, watch_mode=args.watch_mode)
+                      num_hours=num_hours, sort_by=args.sort_by, watch_mode=args.watch_mode,
+                      save_snapshot_flag=not args.no_snapshot,
+                      snapshot_tags=user_tags, snapshot_note=user_note)
         return
     
     keywords = [args.keyword]
@@ -1841,7 +2375,9 @@ def main():
         )
         datasets.append({'keyword': keyword, 'data': data['data'], 'source': source})
         
-        analysis = print_analysis(keyword, data, source, cache_hit, prev_cache, prev_snapshot)
+        analysis = print_analysis(keyword, data, source, cache_hit, prev_cache, prev_snapshot,
+                                  save_snapshot_flag=not args.no_snapshot,
+                                  tags=user_tags, note=user_note)
         if analysis:
             analyses.append(analysis)
     
@@ -1856,23 +2392,31 @@ def main():
     print(chart)
     
     if args.export:
-        if export_to_csv(datasets, args.export):
-            print(f"\n✓ 原始数据已导出到: {args.export}")
+        export_file = args.export
+        if export_file == 'auto':
+            kws = [args.keyword]
+            if args.compare:
+                kws.append(args.compare)
+            export_file = generate_smart_filename(kws, start_date, end_date, num_hours, 'csv')
+            print(f"\n💾 自动生成文件名: {export_file}")
+        
+        if export_to_csv(datasets, export_file):
+            print(f"\n✓ 原始数据已导出到: {export_file}")
             
             if analyses:
                 sorted_analyses, sort_name, _ = sort_analyses(analyses, args.sort_by)
-                summary_file = args.export.replace('.csv', '_summary.csv')
+                summary_file = export_file.replace('.csv', '_summary.csv')
                 if export_summary_csv(sorted_analyses, summary_file, args.sort_by, args.watch_mode):
                     print(f"✓ 汇总报告已导出到: {summary_file} (按{sort_name}排序)")
                 
-                md_file = args.export.replace('.csv', '.md')
+                md_file = export_file.replace('.csv', '.md')
                 if export_markdown_report(sorted_analyses, datasets, md_file, args.sort_by, args.watch_mode):
                     print(f"✓ Markdown报告已导出到: {md_file}")
         else:
             print(f"\n❌ 导出失败")
     
     print(f"\n{'═'*60}")
-    print(f"💡 提示：使用 --snapshot-list 查看快照历史，--watch-mode 开启关注清单模式")
+    print(f"💡 提示：--snapshot-list 查看历史 | --snapshot-tag/--snapshot-note 给快照加标签 | --history-only 只看历史")
     print(f"{'═'*60}\n")
 
 
